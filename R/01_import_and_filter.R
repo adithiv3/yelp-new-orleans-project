@@ -90,3 +90,6 @@ saveRDS(select(reviews_nola, -text), "data/new_orleans/reviews_new_orleans.rds",
 
 files <- list.files("data/new_orleans", full.names = TRUE)
 print(tibble(file = basename(files), MB = round(file.size(files) / 1e6, 1)))
+
+readRDS("data/new_orleans/business_new_orleans.rds") |> dplyr::glimpse()
+readRDS("data/new_orleans/reviews_new_orleans.rds") |> dplyr::glimpse()
