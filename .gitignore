@@ -48,3 +48,7 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+data/raw/
+data/new_orleans/reviews_new_orleans_with_text.rds
+.DS_Store
