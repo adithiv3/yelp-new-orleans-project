@@ -1,0 +1,328 @@
+---
+title: "Yelp New Orleans Restaurants: Categories, Reviews, and Geography"
+subtitle: "Steps 3-6: choosing a restaurant theme and a geographic system"
+author: "Adithi Vuligonda"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center")
+library(tidyverse)
+library(sf)
+library(tigris)
+library(scales)
+library(viridis)
+options(tigris_use_cache = TRUE)
+dir.create("figures", showWarnings = FALSE)
+crs_m <- 26915   # UTM zone 15N (meters): one common projected CRS for all spatial joins
+```
+
+## Research question
+
+Where in New Orleans can someone with dietary restrictions (such as halal, vegetarian, vegan) find the best restaurants, and which geographic area is best for finding them?
+
+## Data
+
+```{r load-data}
+business <- readRDS("data/new_orleans/business_new_orleans.rds")
+reviews  <- readRDS("data/new_orleans/reviews_new_orleans.rds")
+cat("Restaurants:", nrow(business), "| Reviews:", nrow(reviews), "\n")
+```
+
+These are the New Orleans restaurants (Yelp `city` = "New Orleans" and a category containing "Restaurants") and all of their reviews from the Yelp Open Dataset.
+
+## Choosing related restaurant categories
+
+### Category counts
+
+```{r category-counts}
+restaurant_categories <- business |>
+  select(business_id, business_name, categories) |>
+  separate_rows(categories, sep = ",") |>
+  mutate(category = str_squish(str_to_lower(categories))) |>
+  filter(category != "") |>
+  distinct(business_id, business_name, category)
+
+category_counts <- restaurant_categories |> count(category, sort = TRUE)
+category_counts |> slice_head(n = 40)
+```
+
+### Categories that appear together
+
+```{r co-occurrence}
+frequent <- category_counts |> filter(n >= 20, category != "restaurants") |> pull(category)
+freq_cats <- restaurant_categories |> filter(category %in% frequent)
+
+pair_counts <- freq_cats |>
+  inner_join(freq_cats, by = c("business_id", "business_name"),
+             suffix = c("_a", "_b"), relationship = "many-to-many") |>
+  filter(category_a < category_b) |>
+  count(category_a, category_b, sort = TRUE)
+
+pair_counts |> slice_head(n = 25)
+```
+
+### My selected categories
+
+```{r selected}
+selected_categories <- c("seafood", "cajun/creole", "southern")   # EDIT: your theme
+
+missing_cats <- setdiff(selected_categories, category_counts$category)
+stopifnot("These categories are not in the data; check the spelling in category_counts" =
+            length(missing_cats) == 0)
+
+selected_ids <- restaurant_categories |>
+  filter(category %in% selected_categories) |>
+  distinct(business_id)
+
+selected_restaurants <- business |>
+  semi_join(selected_ids, by = "business_id") |>
+  filter(!is.na(latitude), !is.na(longitude))
+
+restaurant_categories |>
+  filter(category %in% selected_categories) |>
+  count(category, name = "restaurants")
+
+restaurant_categories |>
+  filter(category %in% selected_categories) |>
+  count(business_id, name = "categories_matched") |>
+  count(categories_matched, name = "restaurants")
+
+cat("Qualifying restaurants:", nrow(selected_restaurants), "\n")
+```
+
+**WRITE:** the three or more categories you chose, why they belong together, the inclusion rule (a restaurant qualifies if it matches at least one of them), the number of qualifying restaurants, and what the co-occurrence table shows (which of your categories overlap).
+
+## Joining restaurants to their reviews
+
+```{r reviews}
+selected_reviews <- reviews |>
+  semi_join(selected_restaurants, by = "business_id") |>
+  mutate(review_date = as.Date(date), review_year = lubridate::year(review_date))
+
+business_review_summary <- selected_reviews |>
+  group_by(business_id) |>
+  summarise(reviews_in_file = n(),
+            avg_stars_all_reviewers = mean(stars),
+            .groups = "drop")
+
+selected_restaurants <- selected_restaurants |>
+  left_join(business_review_summary, by = "business_id")
+
+selected_reviews |>
+  summarise(reviews = n(), restaurants = n_distinct(business_id),
+            reviewers = n_distinct(user_id))
+```
+
+I filtered the reviews to the selected restaurants first, so the rest of the analysis does not carry reviews for unrelated businesses.
+
+## Official city boundary with a spatial join
+
+```{r places-join}
+make_points <- function(df) {
+  st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) |>
+    st_transform(crs_m)
+}
+
+# If year = 2024 gives an error, try 2023
+louisiana_places <- tigris::places(state = "LA", cb = TRUE, year = 2024) |>
+  st_make_valid() |>
+  st_transform(crs_m)
+
+all_points <- make_points(filter(business, !is.na(latitude), !is.na(longitude)))
+
+restaurants_with_place <- all_points |>
+  st_join(louisiana_places |> select(place_geoid = GEOID, place_name = NAME),
+          join = st_within, left = TRUE) |>
+  distinct(business_id, .keep_all = TRUE)
+
+city_vs_place <- restaurants_with_place |>
+  st_drop_geometry() |>
+  count(city, place_name, sort = TRUE)
+city_vs_place
+
+mismatches <- restaurants_with_place |>
+  st_drop_geometry() |>
+  filter(is.na(place_name) | place_name != "New Orleans") |>
+  select(business_name, address, postal_code, place_name, latitude, longitude)
+cat("Restaurants labeled New Orleans by Yelp but outside the official city polygon:",
+    nrow(mismatches), "\n")
+head(mismatches, 10)
+```
+
+```{r places-map, fig.width=8, fig.height=7}
+nola_boundary <- louisiana_places |> filter(NAME == "New Orleans")
+nola_points <- filter(restaurants_with_place, place_name == "New Orleans")
+bb_all <- st_bbox(nola_points)
+
+ggplot() +
+  geom_sf(data = nola_boundary, fill = "grey95", color = "grey35") +
+  geom_sf(data = nola_points, aes(color = stars), alpha = 0.6, size = 1) +
+  scale_color_viridis_c(option = "C", limits = c(1, 5)) +
+  coord_sf(xlim = c(as.numeric(bb_all["xmin"]) - 2000, as.numeric(bb_all["xmax"]) + 2000),
+           ylim = c(as.numeric(bb_all["ymin"]) - 2000, as.numeric(bb_all["ymax"]) + 2000)) +
+  labs(title = "Yelp restaurants located within New Orleans", color = "Business\nstars") +
+  theme_minimal()
+```
+
+**WRITE:** what the mismatch table shows and your explanation for the mismatches (geocoding differences, businesses near a boundary, postal-city labels, bad coordinates). Look at a few rows before you decide.
+
+## Comparing geographic systems
+
+### Boundary files
+
+```{r boundaries}
+# ZIP Code Tabulation Areas (all Louisiana "70..." ZCTAs; if year = 2020 errors, try 2010)
+zcta_raw <- tigris::zctas(cb = TRUE, starts_with = "70", year = 2020)
+zip_col <- intersect(c("ZCTA5CE20", "GEOID20", "ZCTA5CE10", "GEOID10", "GEOID"), names(zcta_raw))[1]
+zcta <- zcta_raw |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = as.character(.data[[zip_col]]), area_name = paste("ZIP", area_id))
+
+# Census tracts and block groups in Orleans Parish
+tract <- tigris::tracts(state = "LA", county = "Orleans", cb = TRUE, year = 2022) |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = GEOID, area_name = paste("Tract", NAME))
+
+block_group <- tigris::block_groups(state = "LA", county = "Orleans", cb = TRUE, year = 2022) |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = GEOID, area_name = paste("Block group", GEOID))
+
+# Optional local files from Data.NOLA.gov (see notes): neighborhoods and wards
+read_local_boundary <- function(path, name_candidates, prefix = "") {
+  if (!file.exists(path)) return(NULL)
+  x <- st_read(path, quiet = TRUE) |> st_make_valid() |> st_transform(crs_m)
+  nm <- intersect(name_candidates, names(x))[1]
+  if (is.na(nm)) stop("No name column found in ", path, ". Columns: ", paste(names(x), collapse = ", "))
+  x |> mutate(area_name = paste0(prefix, as.character(.data[[nm]])), area_id = area_name) |>
+    select(area_id, area_name)
+}
+neighborhoods <- read_local_boundary("data/boundaries/neighborhoods.geojson",
+  c("gnocdc_lab", "GNOCDC_LAB", "neighborhood", "NEIGHBORHOOD", "name", "NAME", "label", "LABEL"))
+wards <- read_local_boundary("data/boundaries/wards.geojson",
+  c("ward", "WARD", "Ward", "name", "NAME"), prefix = "Ward ")
+
+systems <- list("ZIP/ZCTA" = zcta, "Census tract" = tract, "Census block group" = block_group)
+if (!is.null(neighborhoods)) systems[["Neighborhood Statistical Area"]] <- neighborhoods
+if (!is.null(wards)) systems[["Ward"]] <- wards
+names(systems)
+```
+
+### Assign restaurants to areas
+
+```{r assign}
+sel_points <- make_points(selected_restaurants)
+
+assign_to_areas <- function(points_sf, boundary_sf) {
+  points_sf |>
+    st_join(boundary_sf, join = st_within, left = TRUE) |>
+    st_drop_geometry() |>
+    distinct(business_id, .keep_all = TRUE)
+}
+
+summarise_areas <- function(assigned) {
+  assigned |>
+    filter(!is.na(area_id)) |>
+    group_by(area_id, area_name) |>
+    summarise(n_restaurants = n(),
+              total_reviews = sum(reviews_in_file, na.rm = TRUE),
+              avg_business_stars = mean(stars),
+              avg_review_stars = weighted.mean(avg_stars_all_reviewers, reviews_in_file, na.rm = TRUE),
+              .groups = "drop")
+}
+
+assigned_list <- map(systems, ~ assign_to_areas(sel_points, .x))
+area_list <- map(assigned_list, summarise_areas)
+```
+
+### Comparison table
+
+```{r comparison}
+comparison <- imap_dfr(assigned_list, function(a, nm) {
+  s <- area_list[[nm]]
+  tibble(`Geographic system` = nm,
+         `Areas containing a selected restaurant` = nrow(s),
+         `Restaurants assigned` = sum(!is.na(a$area_id)),
+         `Unmatched restaurants` = sum(is.na(a$area_id)),
+         `Smallest area count` = min(s$n_restaurants),
+         `Median area count` = median(s$n_restaurants),
+         `Largest area count` = max(s$n_restaurants),
+         `Areas with 5+ restaurants` = sum(s$n_restaurants >= 5))
+})
+knitr::kable(comparison, caption = "Comparison of geographic systems for my selected restaurants")
+write_csv(comparison, "figures/geography_comparison.csv")
+```
+
+Requirement check: `r nrow(selected_restaurants)` qualifying restaurants (need at least 10) in `r paste(comparison$"Areas containing a selected restaurant", collapse = ", ")` areas under the systems above, in the order shown (need at least 7).
+
+```{r area-size-plot, fig.width=9, fig.height=5}
+bind_rows(area_list, .id = "system") |>
+  ggplot(aes(n_restaurants)) +
+  geom_histogram(binwidth = 2, fill = "lightblue", color = "grey70") +
+  facet_wrap(~system, scales = "free_y") +
+  labs(title = "How many selected restaurants fall in each area?",
+       x = "Restaurants per area", y = "Number of areas") +
+  theme_minimal()
+```
+
+### Maps
+
+```{r maps, fig.width=8, fig.height=7}
+bb <- st_bbox(sel_points)
+pad <- 2000
+map_system <- function(boundary, area_tbl, fill_var, title, legend, min_n = 0) {
+  d <- boundary |>
+    inner_join(area_tbl, by = c("area_id", "area_name")) |>
+    mutate(value = if_else(n_restaurants >= min_n, .data[[fill_var]], NA_real_))
+  ggplot(d) +
+    geom_sf(aes(fill = value), color = "white", linewidth = 0.2) +
+    scale_fill_viridis_c(option = "C", na.value = "grey85") +
+    coord_sf(xlim = c(as.numeric(bb["xmin"]) - pad, as.numeric(bb["xmax"]) + pad),
+             ylim = c(as.numeric(bb["ymin"]) - pad, as.numeric(bb["ymax"]) + pad)) +
+    labs(title = title, fill = legend) +
+    theme_minimal()
+}
+
+for (nm in names(systems)) {
+  p1 <- map_system(systems[[nm]], area_list[[nm]], "n_restaurants",
+                   paste0(nm, ": selected restaurants per area"), "Restaurants")
+  p2 <- map_system(systems[[nm]], area_list[[nm]], "avg_review_stars",
+                   paste0(nm, ": average review stars (areas with 5+ restaurants)"),
+                   "Avg stars", min_n = 5)
+  print(p1); print(p2)
+  slug <- str_replace_all(str_to_lower(nm), "[^a-z0-9]+", "_")
+  ggsave(paste0("figures/map_counts_", slug, ".png"), p1, width = 8, height = 7, dpi = 200)
+  ggsave(paste0("figures/map_stars_", slug, ".png"), p2, width = 8, height = 7, dpi = 200)
+}
+```
+
+## My chosen geographic system
+
+```{r chosen}
+chosen_system <- "ZIP/ZCTA"   # EDIT after reading the comparison table and maps
+min_n <- 5
+
+area_list[[chosen_system]] |>
+  filter(n_restaurants >= min_n) |>
+  arrange(desc(avg_review_stars)) |>
+  select(area_name, n_restaurants, total_reviews, avg_business_stars, avg_review_stars) |>
+  slice_head(n = 10) |>
+  knitr::kable(digits = 2, caption = paste0("Top areas by average review stars (", chosen_system,
+                                           ", areas with at least ", min_n, " restaurants)"))
+```
+
+**WRITE:** which system you chose and why. Use the comparison table and maps, and address each criterion: fit with the question, readability to a general audience, enough restaurants per area, areas not too large or small, unmatched points, usefulness for maps, and clear documentation. Say what the chosen boundaries reveal and what they hide, and why you did not choose the others.
+
+## Limitations
+
+**WRITE:** areas with few restaurants, ratings that are not adjusted for reviewer habits (Step 7 will address this), and anything else you noticed.
