@@ -1,0 +1,4 @@
+Geographic system,Areas containing a selected restaurant,Restaurants assigned,Unmatched restaurants,Smallest area count,Median area count,Largest area count,Areas with 5+ restaurants
+ZIP/ZCTA,12,125,0,1,11,26,8
+Census tract,47,124,1,1,2,24,4
+Census block group,64,124,1,1,1,10,4

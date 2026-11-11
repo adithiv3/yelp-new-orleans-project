@@ -1,0 +1,340 @@
+---
+title: "Dietary-Restriction Restaurants in New Orleans"
+subtitle: "Steps 3–6: categories, reviews, spatial joins, and geographic choice"
+author: "Adithi Vuligonda"
+date: today
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = "center")
+library(tidyverse)
+library(sf)
+library(tigris)
+library(scales)
+library(viridis)
+options(tigris_use_cache = TRUE)
+dir.create("figures", showWarnings = FALSE)
+crs_m <- 26915
+```
+
+## Research question
+
+Where in New Orleans can someone with dietary restrictions find the best halal,
+vegetarian, and vegan restaurants, and which geographic area is most useful for
+finding them?
+
+## Data
+
+```{r load-data}
+business <- readRDS("data/new_orleans/business_new_orleans.rds")
+reviews  <- readRDS("data/new_orleans/reviews_new_orleans.rds")
+cat("Restaurants:", nrow(business), "| Reviews:", nrow(reviews), "\n")
+```
+
+The business file contains 2,259 New Orleans restaurants and the review file
+contains 476,421 reviews for those restaurants. The raw Yelp JSON files were
+processed in chunks during Steps 1–2 and are not required for this report.
+
+## Step 3: Selecting related categories
+
+I selected `halal`, `vegetarian`, and `vegan` because all three describe dietary
+options that can help a diner with dietary restrictions choose a restaurant.
+They are related, but they are not interchangeable: halal is a religious dietary
+standard, while vegetarian and vegan describe food restrictions. A restaurant
+qualifies if it matches **at least one** selected Yelp category.
+
+```{r category-counts}
+restaurant_categories <- business |>
+  select(business_id, business_name, categories) |>
+  separate_rows(categories, sep = ",") |>
+  mutate(category = str_squish(str_to_lower(categories))) |>
+  filter(category != "") |>
+  distinct(business_id, business_name, category)
+
+category_counts <- restaurant_categories |> count(category, sort = TRUE)
+category_counts |> filter(category %in% c("halal", "vegetarian", "vegan"))
+```
+
+The selected categories occur on 11 halal, 70 vegetarian, and 68 vegan
+business records. Because a business may have more than one label, these counts
+should not be added together to estimate the number of restaurants.
+
+```{r co-occurrence}
+selected_categories <- c("halal", "vegetarian", "vegan")
+
+selected_ids <- restaurant_categories |>
+  filter(category %in% selected_categories) |>
+  distinct(business_id)
+
+selected_category_rows <- restaurant_categories |>
+  filter(category %in% selected_categories)
+
+selected_restaurants <- business |>
+  semi_join(selected_ids, by = "business_id") |>
+  filter(!is.na(latitude), !is.na(longitude))
+
+pair_counts <- inner_join(
+  selected_category_rows,
+  selected_category_rows,
+  by = c("business_id", "business_name"),
+  suffix = c("_a", "_b"),
+  relationship = "many-to-many"
+) |>
+  filter(category_a < category_b) |>
+  count(category_a, category_b, sort = TRUE)
+
+pair_counts
+cat("Qualifying restaurants:", nrow(selected_restaurants), "\n")
+```
+
+There are **125 qualifying restaurants**. The strongest overlap is between vegan
+and vegetarian (21 businesses). Three businesses are both halal and vegetarian,
+and one is both halal and vegan. Thus, the inclusion rule broadens the analysis
+to restaurants offering any of the three options while still allowing overlap
+to be reported transparently.
+
+## Step 4: Joining businesses to reviews
+
+```{r reviews}
+selected_reviews <- reviews |>
+  semi_join(selected_restaurants, by = "business_id") |>
+  mutate(review_date = as.Date(date), review_year = lubridate::year(review_date))
+
+business_review_summary <- selected_reviews |>
+  group_by(business_id) |>
+  summarise(
+    reviews_in_file = n(),
+    avg_review_stars = mean(stars, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+selected_restaurants <- selected_restaurants |>
+  left_join(business_review_summary, by = "business_id")
+
+selected_reviews |>
+  summarise(
+    reviews = n(),
+    restaurants = n_distinct(business_id),
+    reviewers = n_distinct(user_id)
+  )
+```
+
+Filtering before the join leaves **29,334 reviews** from **22,665 reviewers**
+for the 125 selected restaurants. The restaurant-level review average is an
+ordinary mean across all available reviews; it is not a reviewer-normalized
+score, because reviewer normalization is part of Step 7.
+
+## Step 5: Official city boundary
+
+```{r places-join}
+make_points <- function(df) {
+  st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326,
+           remove = FALSE) |>
+    st_transform(crs_m)
+}
+
+louisiana_places <- tigris::places(state = "LA", cb = TRUE, year = 2024) |>
+  st_make_valid() |>
+  st_transform(crs_m)
+
+all_points <- make_points(filter(business, !is.na(latitude), !is.na(longitude)))
+
+restaurants_with_place <- all_points |>
+  st_join(louisiana_places |> select(place_geoid = GEOID,
+                                     place_name = NAME),
+          join = st_within, left = TRUE) |>
+  distinct(business_id, .keep_all = TRUE)
+
+city_vs_place <- restaurants_with_place |>
+  st_drop_geometry() |>
+  count(city, place_name, sort = TRUE)
+city_vs_place
+
+mismatches <- restaurants_with_place |>
+  st_drop_geometry() |>
+  filter(is.na(place_name) | place_name != "New Orleans") |>
+  select(business_name, address, postal_code, place_name, latitude, longitude)
+
+cat("Restaurants labeled New Orleans but outside the official polygon:",
+    nrow(mismatches), "\n")
+head(mismatches, 10)
+```
+
+The spatial join identifies **2,202** businesses whose Yelp city label and
+official place are both New Orleans. It identifies **57 mismatches**. The
+mismatches are concentrated in nearby places such as Elmwood, Jefferson, and
+Harahan, with some businesses in Gretna, Terrytown, and other neighboring
+communities. This pattern suggests that Yelp's `city` field often reflects a
+postal or marketing address rather than the municipal polygon containing the
+coordinates. I retain the Yelp-defined New Orleans restaurant set for the main
+analysis, but report this boundary limitation rather than silently deleting the
+mismatches.
+
+```{r places-map, fig.width=8, fig.height=7}
+nola_boundary <- louisiana_places |> filter(NAME == "New Orleans")
+nola_points <- filter(restaurants_with_place, place_name == "New Orleans")
+
+ggplot() +
+  geom_sf(data = nola_boundary, fill = "grey95", color = "grey35") +
+  geom_sf(data = nola_points, aes(color = stars), alpha = 0.6, size = 1) +
+  scale_color_viridis_c(option = "C", limits = c(1, 5)) +
+  labs(title = "Yelp restaurants located within New Orleans",
+       color = "Business\nstars") +
+  theme_minimal()
+```
+
+## Step 6: Choose and defend a geographic area
+
+### Comparing geographic systems
+
+I compare ZIP Code Tabulation Areas, Census tracts, and Census block groups.
+The Census layers are downloaded through `tigris`; the points are transformed
+to UTM zone 15N before joining so that all spatial layers use the same projected
+coordinate system.
+
+```{r boundaries}
+zcta_raw <- tigris::zctas(cb = TRUE, starts_with = "70", year = 2020)
+zip_col <- intersect(c("ZCTA5CE20", "GEOID20", "ZCTA5CE10", "GEOID10", "GEOID"),
+                     names(zcta_raw))[1]
+zcta <- zcta_raw |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = as.character(.data[[zip_col]]),
+            area_name = paste("ZIP", area_id))
+
+tract <- tigris::tracts(state = "LA", county = "Orleans", cb = TRUE, year = 2022) |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = GEOID, area_name = paste("Tract", NAME))
+
+block_group <- tigris::block_groups(state = "LA", county = "Orleans", cb = TRUE,
+                                    year = 2022) |>
+  st_make_valid() |> st_transform(crs_m) |>
+  transmute(area_id = GEOID, area_name = paste("Block group", GEOID))
+
+systems <- list("ZIP/ZCTA" = zcta, "Census tract" = tract,
+                "Census block group" = block_group)
+```
+
+```{r assign}
+sel_points <- make_points(selected_restaurants)
+
+assign_to_areas <- function(points_sf, boundary_sf) {
+  points_sf |>
+    st_join(boundary_sf, join = st_within, left = TRUE) |>
+    st_drop_geometry() |>
+    distinct(business_id, .keep_all = TRUE)
+}
+
+summarise_areas <- function(assigned) {
+  assigned |>
+    filter(!is.na(area_id)) |>
+    group_by(area_id, area_name) |>
+    summarise(
+      n_restaurants = n(),
+      total_reviews = sum(reviews_in_file, na.rm = TRUE),
+      avg_business_stars = mean(stars, na.rm = TRUE),
+      avg_review_stars = weighted.mean(avg_review_stars, reviews_in_file,
+                                      na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+assigned_list <- map(systems, ~ assign_to_areas(sel_points, .x))
+area_list <- map(assigned_list, summarise_areas)
+
+comparison <- imap_dfr(assigned_list, function(a, nm) {
+  s <- area_list[[nm]]
+  tibble(
+    `Geographic system` = nm,
+    `Areas containing a selected restaurant` = nrow(s),
+    `Restaurants assigned` = sum(!is.na(a$area_id)),
+    `Unmatched restaurants` = sum(is.na(a$area_id)),
+    `Smallest area count` = min(s$n_restaurants),
+    `Median area count` = median(s$n_restaurants),
+    `Largest area count` = max(s$n_restaurants),
+    `Areas with 5+ restaurants` = sum(s$n_restaurants >= 5)
+  )
+})
+
+knitr::kable(comparison, digits = 2,
+             caption = "Comparison of geographic systems")
+write_csv(comparison, "figures/geography_comparison.csv")
+```
+
+The resulting comparison is:
+
+| Geographic system | Areas | Assigned | Unmatched | Smallest | Median | Largest | Areas with 5+ |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| ZIP/ZCTA | 12 | 125 | 0 | 1 | 11 | 26 | 8 |
+| Census tract | 47 | 124 | 1 | 1 | 2 | 24 | 4 |
+| Census block group | 64 | 124 | 1 | 1 | 1 | 10 | 4 |
+
+ZIP/ZCTAs provide the clearest comparison for this question. They are familiar
+to a general audience, have no unmatched selected restaurants, and concentrate
+the restaurants into 12 areas, including eight with at least five restaurants.
+The tract and block-group systems provide more geographic detail, but most
+areas contain only one or two selected restaurants. Their apparent top ratings
+would therefore be more sensitive to individual businesses and small samples.
+
+```{r zip-results}
+area_list[["ZIP/ZCTA"]] |>
+  filter(n_restaurants >= 5) |>
+  arrange(desc(avg_review_stars)) |>
+  select(area_name, n_restaurants, total_reviews,
+         avg_business_stars, avg_review_stars) |>
+  knitr::kable(digits = 2,
+    caption = "ZIP/ZCTA areas with at least five selected restaurants")
+```
+
+Among ZIP areas with at least five restaurants, ZIP 70112 has the highest raw
+average review score (about 4.41), followed closely by ZIP 70113 (about 4.40)
+and ZIP 70118 (about 4.33). ZIP 70130 has the largest number of qualifying
+restaurants (26), while ZIP 70116, 70119, 70115, 70112, and 70118 also have
+substantial numbers of restaurants.
+This distinction matters: the area with the highest average is not necessarily
+the area with the greatest choice.
+
+```{r area-map, fig.width=8, fig.height=7}
+area_map <- zcta |>
+  inner_join(area_list[["ZIP/ZCTA"]], by = c("area_id", "area_name"))
+
+ggplot(area_map) +
+  geom_sf(aes(fill = n_restaurants), color = "white", linewidth = 0.2) +
+  scale_fill_viridis_c(option = "C", na.value = "grey85") +
+  labs(title = "Halal, vegetarian, and vegan restaurants by ZIP/ZCTA",
+       fill = "Restaurants") +
+  theme_minimal()
+```
+
+### Choosing ZIP/ZCTA
+
+I chose **ZIP/ZCTA** as the primary geographic system. ZIP areas fit the
+practical question of where a visitor can look for restaurants, are easier to
+interpret than Census identifiers, support a readable map, contain all 125
+selected restaurants, and generally provide more stable comparisons than the
+smaller tract and block-group areas. ZIP/ZCTAs do not represent neighborhoods,
+and their boundaries are designed for Census tabulation rather than exact
+postal delivery routes. They can also combine places that feel different on the
+ground. Census tracts and block groups reveal finer spatial variation but hide
+the instability caused by very small restaurant counts.
+
+### Limitations
+
+The main limitations are that the Yelp categories are user/platform labels and
+do not independently verify that a restaurant is halal, vegetarian, or vegan.
+The analysis is also observational: Yelp review volume and ratings may reflect
+who chooses to review, not only restaurant quality. Several areas have only one
+or a few restaurants, and the Yelp city label disagrees with the official city
+polygon for 57 businesses in the full restaurant dataset. Finally, the scores
+shown here are ordinary review averages and are not adjusted for reviewer
+scoring habits; reviewer normalization is reserved for Step 7.
