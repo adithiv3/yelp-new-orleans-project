@@ -1,6 +1,6 @@
 ---
 title: "Dietary-Restriction Restaurants in New Orleans"
-subtitle: "Steps 1–7: import, categories, geography, and reviewer-adjusted ratings"
+subtitle: "Categories, reviews, spatial joins, geographic choice, and reviewer-adjusted ratings"
 author: "Adithi Vuligonda"
 date: today
 format:
@@ -25,14 +25,31 @@ library(scales)
 library(viridis)
 options(tigris_use_cache = TRUE)
 dir.create("figures", showWarnings = FALSE)
-crs_m <- 26915
+crs_m <- 26915   # UTM zone 15N (meters): one common projected CRS for every spatial join
+
+theme_report <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = rel(1.5)),
+      plot.subtitle = element_text(face = "italic", color = "grey30"),
+      plot.title.position = "plot",
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "grey20"),
+      legend.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold")
+    )
+}
 ```
 
 ## Research question
 
-Where in New Orleans can someone with dietary restrictions find the best halal,
-vegetarian, and vegan restaurants, and which geographic area is most useful for
-finding them?
+> Where in New Orleans can someone who eats halal, vegetarian, or vegan food find the best restaurants, and which geographic area is most useful for finding them?
+
+I define "best" using four kinds of evidence: (1) the average Yelp rating, (2) review volume, (3) a reviewer-adjusted score that compares each rating with the reviewer's own usual rating (Step 7), and (4) reliability, meaning that restaurants and areas need enough reviews and enough restaurants for the comparison to be meaningful.
+
+## Executive summary
+
+Using all 476,421 Yelp reviews of New Orleans restaurants, I found 125 restaurants tagged halal, vegetarian, or vegan and compared three ways of dividing the city into areas; ZIP codes worked best. ZIP 70119 is the most dependable area for finding these restaurants (19 restaurants, the second-best reviewer-adjusted score, and two of my top 10), while ZIP 70130 offers the most choice (26 restaurants). Adjusting each rating for the reviewer's own habits changes the ranking a lot: the raw top of the list is led by places with very few reviews (Viva Las Vegan has 5), while my top 10 is led by The Fat Falafel, Ms. Beasley's, and Addis Nola. The main caveat is that the adjusted scores use only reviewers with at least five reviews (9.6% of reviews), and several top-10 restaurants rest on only 5 to 10 such reviews.
 
 ## Data
 
@@ -42,17 +59,24 @@ reviews  <- readRDS("data/new_orleans/reviews_new_orleans.rds")
 cat("Restaurants:", nrow(business), "| Reviews:", nrow(reviews), "\n")
 ```
 
-The business file contains 2,259 New Orleans restaurants and the review file
-contains 476,421 reviews for those restaurants. The raw Yelp JSON files were
-processed in chunks during Steps 1–2 and are not required for this report.
+The business file contains `r format(nrow(business), big.mark = ",")` New Orleans restaurants (Yelp `city` is "New Orleans" and the categories include "Restaurants"), and the review file contains `r format(nrow(reviews), big.mark = ",")` reviews for those restaurants. These are the complete set of New Orleans restaurants and all of their reviews in the Yelp Open Dataset. The raw JSON files are not in this repository (see the README for download instructions).
 
-## Step 3: Selecting related categories
+## Managing the large Yelp files
 
-I selected `halal`, `vegetarian`, and `vegan` because all three describe dietary
-options that can help a diner with dietary restrictions choose a restaurant.
-They are related, but they are not interchangeable: halal is a religious dietary
-standard, while vegetarian and vegan describe food restrictions. A restaurant
-qualifies if it matches **at least one** selected Yelp category.
+* **Size.** The business file was 113 MB and the review file was 5.0 GB (6,990,280 reviews).
+* **Download and extraction.** The download was a zip that contained a tar archive. I extracted only the two JSON files I needed with `tar`, which avoided unpacking the optional user file. My first `unzip` and `tar` commands failed because the downloaded file's name contained a space and needed quotes, and I had pasted commands with `#` comments on the same line, which my terminal tried to run as commands. After fixing both, `tar` extracted the two files (113 MB and 5.0 GB).
+* **Import strategy.** The business file fit in memory (150,346 businesses), so I read it with `jsonlite::stream_in()` and kept 11 columns. The review file was too large to load at once. I used a `stream_in()` handler that processed 100,000 reviews at a time and kept only reviews whose `business_id` belonged to my New Orleans restaurants, leaving 476,421 reviews. The code is in [`R/01_import_and_filter.R`](https://github.com/adithiv3/yelp-new-orleans-project/blob/main/R/01_import_and_filter.R).
+* **Storage.** I saved compressed `.rds` files (117 KB for businesses, 8.7 MB for reviews without the review text, 78 MB for reviews with the text). The 78 MB file and the raw JSON are not committed to GitHub, and I deleted the raw files after confirming that the saved files load.
+* **Checks.** Every restaurant has at least one review in the file, and the review file has about 2% more reviews than the sum of Yelp's `review_count` field (476,421 versus 465,982), probably because the two fields were updated at different times. I use the review file's counts in all analyses.
+* **Memory and time.** The review file never had to fit in memory because it was read 100,000 reviews at a time. Importing and saving 6,990,280 reviews took about 11 minutes (my file timestamps show the business file saved at 22:46 and the review files at 22:57). My first run of the script stopped with a printing error (`print.default`) because R was printing a data frame; converting the data to tibbles fixed it.
+
+## Step 3: Selecting related restaurant categories
+
+```{r selected-setup}
+selected_categories <- c("halal", "vegetarian", "vegan")
+```
+
+I selected `halal`, `vegetarian`, and `vegan` because all three describe dietary options that help a diner with dietary restrictions choose where to eat. They are related but not interchangeable: halal is a religious dietary standard, while vegetarian and vegan describe food restrictions. I did not simply choose the most common categories; I chose categories that answer the same practical question. A restaurant qualifies if it matches **at least one** of the three Yelp categories.
 
 ```{r category-counts}
 restaurant_categories <- business |>
@@ -63,16 +87,13 @@ restaurant_categories <- business |>
   distinct(business_id, business_name, category)
 
 category_counts <- restaurant_categories |> count(category, sort = TRUE)
-category_counts |> filter(category %in% c("halal", "vegetarian", "vegan"))
+cc3 <- category_counts |> filter(category %in% selected_categories)
+cc3
 ```
 
-The selected categories occur on 11 halal, 70 vegetarian, and 68 vegan
-business records. Because a business may have more than one label, these counts
-should not be added together to estimate the number of restaurants.
+The selected categories appear on `r paste0(cc3$n, " ", cc3$category, collapse = ", ")` business records. A business can carry more than one label, so these counts should not be added together to estimate the number of restaurants.
 
 ```{r co-occurrence}
-selected_categories <- c("halal", "vegetarian", "vegan")
-
 selected_ids <- restaurant_categories |>
   filter(category %in% selected_categories) |>
   distinct(business_id)
@@ -85,11 +106,9 @@ selected_restaurants <- business |>
   filter(!is.na(latitude), !is.na(longitude))
 
 pair_counts <- inner_join(
-  selected_category_rows,
-  selected_category_rows,
+  selected_category_rows, selected_category_rows,
   by = c("business_id", "business_name"),
-  suffix = c("_a", "_b"),
-  relationship = "many-to-many"
+  suffix = c("_a", "_b"), relationship = "many-to-many"
 ) |>
   filter(category_a < category_b) |>
   count(category_a, category_b, sort = TRUE)
@@ -98,13 +117,19 @@ pair_counts
 cat("Qualifying restaurants:", nrow(selected_restaurants), "\n")
 ```
 
-There are **125 qualifying restaurants**. The strongest overlap is between vegan
-and vegetarian (21 businesses). Three businesses are both halal and vegetarian,
-and one is both halal and vegan. Thus, the inclusion rule broadens the analysis
-to restaurants offering any of the three options while still allowing overlap
-to be reported transparently.
+There are **`r nrow(selected_restaurants)` qualifying restaurants**. The most common overlap is `r pair_counts$category_a[1]` with `r pair_counts$category_b[1]` (`r pair_counts$n[1]` businesses). The inclusion rule therefore broadens the analysis to restaurants that offer any of the three options, while the overlap is still reported openly.
 
-## Step 4: Joining businesses to reviews
+```{r other-categories}
+restaurant_categories |>
+  semi_join(selected_ids, by = "business_id") |>
+  filter(!category %in% c(selected_categories, "restaurants", "food")) |>
+  count(category, sort = TRUE) |>
+  slice_head(n = 15)
+```
+
+The table above shows what else the selected restaurants offer. The selected group spans many cuisines and restaurant types, which is what a diner with dietary restrictions would want to compare.
+
+## Step 4: Joining restaurants to their reviews
 
 ```{r reviews}
 selected_reviews <- reviews |>
@@ -113,46 +138,36 @@ selected_reviews <- reviews |>
 
 business_review_summary <- selected_reviews |>
   group_by(business_id) |>
-  summarise(
-    reviews_in_file = n(),
-    avg_review_stars = mean(stars, na.rm = TRUE),
-    .groups = "drop"
-  )
+  summarise(reviews_in_file = n(), avg_review_stars = mean(stars, na.rm = TRUE),
+            .groups = "drop")
 
 selected_restaurants <- selected_restaurants |>
   left_join(business_review_summary, by = "business_id")
 
-selected_reviews |>
-  summarise(
-    reviews = n(),
-    restaurants = n_distinct(business_id),
-    reviewers = n_distinct(user_id)
-  )
+sr_summary <- selected_reviews |>
+  summarise(reviews = n(), restaurants = n_distinct(business_id),
+            reviewers = n_distinct(user_id))
+sr_summary
 ```
 
-Filtering before the join leaves **29,334 reviews** from **22,665 reviewers**
-for the 125 selected restaurants. The restaurant-level review average is an
-ordinary mean across all available reviews; it is not a reviewer-normalized
-score, because reviewer normalization is part of Step 7.
+I filtered the reviews to the selected restaurants **before** the join, so the analysis does not carry reviews for unrelated businesses. This leaves **`r format(sr_summary$reviews, big.mark = ",")` reviews** from **`r format(sr_summary$reviewers, big.mark = ",")` reviewers** for the `r sr_summary$restaurants` selected restaurants. The restaurant-level average here is an ordinary mean of all available reviews. It is not reviewer-normalized; normalization is done in Step 7.
 
-## Step 5: Official city boundary
+## Step 5: Official city boundary and a spatial join
 
 ```{r places-join}
 make_points <- function(df) {
-  st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326,
-           remove = FALSE) |>
+  st_as_sf(df, coords = c("longitude", "latitude"), crs = 4326, remove = FALSE) |>
     st_transform(crs_m)
 }
 
 louisiana_places <- tigris::places(state = "LA", cb = TRUE, year = 2024) |>
   st_make_valid() |>
-  st_transform(crs_m)
+  st_transform(crs_m) # If year = 2024 gives an error, try 2023
 
 all_points <- make_points(filter(business, !is.na(latitude), !is.na(longitude)))
 
 restaurants_with_place <- all_points |>
-  st_join(louisiana_places |> select(place_geoid = GEOID,
-                                     place_name = NAME),
+  st_join(louisiana_places |> select(place_geoid = GEOID, place_name = NAME),
           join = st_within, left = TRUE) |>
   distinct(business_id, .keep_all = TRUE)
 
@@ -166,42 +181,41 @@ mismatches <- restaurants_with_place |>
   filter(is.na(place_name) | place_name != "New Orleans") |>
   select(business_name, address, postal_code, place_name, latitude, longitude)
 
-cat("Restaurants labeled New Orleans but outside the official polygon:",
+n_match <- sum(restaurants_with_place$place_name == "New Orleans", na.rm = TRUE)
+mm_top <- mismatches |>
+  mutate(place_name = replace_na(place_name, "(outside any Census place)")) |>
+  count(place_name, sort = TRUE) |>
+  slice_head(n = 3)
+
+cat("Restaurants labeled New Orleans by Yelp but outside the official polygon:",
     nrow(mismatches), "\n")
 head(mismatches, 10)
 ```
 
-The spatial join identifies **2,202** businesses whose Yelp city label and
-official place are both New Orleans. It identifies **57 mismatches**. The
-mismatches are concentrated in nearby places such as Elmwood, Jefferson, and
-Harahan, with some businesses in Gretna, Terrytown, and other neighboring
-communities. This pattern suggests that Yelp's `city` field often reflects a
-postal or marketing address rather than the municipal polygon containing the
-coordinates. I retain the Yelp-defined New Orleans restaurant set for the main
-analysis, but report this boundary limitation rather than silently deleting the
-mismatches.
+The spatial join places **`r format(n_match, big.mark = ",")`** restaurants inside the official New Orleans polygon, and **`r nrow(mismatches)`** restaurants that Yelp labels "New Orleans" fall outside it. The most common official places for these mismatches are `r paste0(mm_top$place_name, " (", mm_top$n, ")", collapse = ", ")`. Many of the rows printed above have mailing-address ZIP codes (for example 70121 and 70123) and sit just across the city line, and at least one has a blank address, which is typical of a mobile business. This suggests that Yelp's `city` field often reflects a mailing-address city name or a geocoding difference rather than the municipal polygon that contains the coordinates. I keep the Yelp-defined New Orleans restaurant set for the main analysis and report this boundary limitation instead of silently deleting the mismatches.
 
 ```{r places-map, fig.width=8, fig.height=7}
 nola_boundary <- louisiana_places |> filter(NAME == "New Orleans")
 nola_points <- filter(restaurants_with_place, place_name == "New Orleans")
+bb_pts <- st_bbox(nola_points)
 
-ggplot() +
+p_places <- ggplot() +
   geom_sf(data = nola_boundary, fill = "grey95", color = "grey35") +
   geom_sf(data = nola_points, aes(color = stars), alpha = 0.6, size = 1) +
   scale_color_viridis_c(option = "C", limits = c(1, 5)) +
-  labs(title = "Yelp restaurants located within New Orleans",
-       color = "Business\nstars") +
-  theme_minimal()
+  coord_sf(xlim = c(as.numeric(bb_pts["xmin"]) - 2000, as.numeric(bb_pts["xmax"]) + 2000),
+           ylim = c(as.numeric(bb_pts["ymin"]) - 2000, as.numeric(bb_pts["ymax"]) + 2000)) +
+  labs(title = "Yelp restaurants located within New Orleans", color = "Business\nstars") +
+  theme_report() + theme(axis.title = element_blank())
+print(p_places)
+ggsave("figures/map_new_orleans_restaurants.png", p_places, width = 8, height = 7, dpi = 200)
 ```
 
-## Step 6: Choose and defend a geographic area
+## Step 6: Choosing and defending a geographic area
 
 ### Comparing geographic systems
 
-I compare ZIP Code Tabulation Areas, Census tracts, and Census block groups.
-The Census layers are downloaded through `tigris`; the points are transformed
-to UTM zone 15N before joining so that all spatial layers use the same projected
-coordinate system.
+I compare three systems: ZIP Code Tabulation Areas (ZCTAs), Census tracts, and Census block groups. All three come from the Census Bureau through `tigris`. Restaurants and boundaries are transformed to UTM zone 15N before joining, so every join uses the same projected coordinate system.
 
 ```{r boundaries}
 zcta_raw <- tigris::zctas(cb = TRUE, starts_with = "70", year = 2020)
@@ -209,20 +223,17 @@ zip_col <- intersect(c("ZCTA5CE20", "GEOID20", "ZCTA5CE10", "GEOID10", "GEOID"),
                      names(zcta_raw))[1]
 zcta <- zcta_raw |>
   st_make_valid() |> st_transform(crs_m) |>
-  transmute(area_id = as.character(.data[[zip_col]]),
-            area_name = paste("ZIP", area_id))
+  transmute(area_id = as.character(.data[[zip_col]]), area_name = paste("ZIP", area_id))
 
 tract <- tigris::tracts(state = "LA", county = "Orleans", cb = TRUE, year = 2022) |>
   st_make_valid() |> st_transform(crs_m) |>
   transmute(area_id = GEOID, area_name = paste("Tract", NAME))
 
-block_group <- tigris::block_groups(state = "LA", county = "Orleans", cb = TRUE,
-                                    year = 2022) |>
+block_group <- tigris::block_groups(state = "LA", county = "Orleans", cb = TRUE, year = 2022) |>
   st_make_valid() |> st_transform(crs_m) |>
   transmute(area_id = GEOID, area_name = paste("Block group", GEOID))
 
-systems <- list("ZIP/ZCTA" = zcta, "Census tract" = tract,
-                "Census block group" = block_group)
+systems <- list("ZIP/ZCTA" = zcta, "Census tract" = tract, "Census block group" = block_group)
 ```
 
 ```{r assign}
@@ -243,8 +254,7 @@ summarise_areas <- function(assigned) {
       n_restaurants = n(),
       total_reviews = sum(reviews_in_file, na.rm = TRUE),
       avg_business_stars = mean(stars, na.rm = TRUE),
-      avg_review_stars = weighted.mean(avg_review_stars, reviews_in_file,
-                                      na.rm = TRUE),
+      avg_review_stars = weighted.mean(avg_review_stars, reviews_in_file, na.rm = TRUE),
       .groups = "drop"
     )
 }
@@ -266,75 +276,339 @@ comparison <- imap_dfr(assigned_list, function(a, nm) {
   )
 })
 
-knitr::kable(comparison, digits = 2,
-             caption = "Comparison of geographic systems")
+knitr::kable(comparison, digits = 2, caption = "Comparison of geographic systems")
 write_csv(comparison, "figures/geography_comparison.csv")
+writeLines(knitr::kable(comparison, format = "markdown"), "figures/geography_comparison.md")
 ```
 
-The resulting comparison is:
+```{r comparison-text, include=FALSE}
+cmp <- comparison |>
+  rename(system = `Geographic system`, n_areas = `Areas containing a selected restaurant`,
+         assigned = `Restaurants assigned`, unmatched = `Unmatched restaurants`,
+         smallest = `Smallest area count`, median_n = `Median area count`,
+         largest = `Largest area count`, areas5 = `Areas with 5+ restaurants`)
+zip_row   <- filter(cmp, system == "ZIP/ZCTA")
+tract_row <- filter(cmp, system == "Census tract")
+bg_row    <- filter(cmp, system == "Census block group")
+```
 
-| Geographic system | Areas | Assigned | Unmatched | Smallest | Median | Largest | Areas with 5+ |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| ZIP/ZCTA | 12 | 125 | 0 | 1 | 11 | 26 | 8 |
-| Census tract | 47 | 124 | 1 | 1 | 2 | 24 | 4 |
-| Census block group | 64 | 124 | 1 | 1 | 1 | 10 | 4 |
+**Requirement check.** My selected group contains `r nrow(selected_restaurants)` restaurants (at least 10 required) located in `r zip_row$n_areas` different ZIP areas (at least 7 required).
 
-ZIP/ZCTAs provide the clearest comparison for this question. They are familiar
-to a general audience, have no unmatched selected restaurants, and concentrate
-the restaurants into 12 areas, including eight with at least five restaurants.
-The tract and block-group systems provide more geographic detail, but most
-areas contain only one or two selected restaurants. Their apparent top ratings
-would therefore be more sensitive to individual businesses and small samples.
+```{r area-size-plot, fig.width=9, fig.height=5}
+p_sizes <- bind_rows(area_list, .id = "system") |>
+  ggplot(aes(n_restaurants)) +
+  geom_histogram(binwidth = 2, fill = "lightblue", color = "grey70") +
+  facet_wrap(~system, scales = "free_y") +
+  labs(title = "How many selected restaurants fall in each area?",
+       x = "Restaurants per area", y = "Number of areas") +
+  theme_report()
+print(p_sizes)
+ggsave("figures/area_size_comparison.png", p_sizes, width = 9, height = 5, dpi = 200)
+```
+
+The plot shows how the three systems divide the same restaurants. Census tracts and block groups mostly contain one or two selected restaurants (median `r tract_row$median_n` per tract and `r bg_row$median_n` per block group), while ZIP/ZCTAs have a median of `r zip_row$median_n`.
+
+#### Restaurants that did not match an area
+
+```{r unmatched}
+unmatched <- imap_dfr(assigned_list, function(a, nm) {
+  a |>
+    filter(is.na(area_id)) |>
+    mutate(system = nm) |>
+    select(system, business_name, address, postal_code, latitude, longitude)
+})
+unmatched
+```
+
+The one unmatched restaurant is City Greens (5161 Citrus Blvd, ZIP 70123). It does not match any Census tract or block group because I downloaded tract and block-group boundaries for Orleans Parish only, and this restaurant is on the Jefferson Parish side of the city line (ZIP 70123 is the polygon on the left of the ZIP map, outside the black city outline). The ZIP/ZCTA boundaries cover all Louisiana "70" ZIP codes, so the ZIP join matched it. It is also one of the Yelp "New Orleans" labels that the Step 5 check found outside the official city polygon.
+
+#### Maps for the finer systems
+
+```{r count-maps, fig.width=8, fig.height=7}
+map_counts <- function(boundary, area_tbl, title) {
+  d <- boundary |> inner_join(area_tbl, by = c("area_id", "area_name"))
+  bbx <- st_bbox(d)
+  ggplot(d) +
+    geom_sf(aes(fill = n_restaurants), color = "white", linewidth = 0.2) +
+    scale_fill_viridis_c(option = "C") +
+    coord_sf(xlim = c(as.numeric(bbx["xmin"]) - 1000, as.numeric(bbx["xmax"]) + 1000),
+             ylim = c(as.numeric(bbx["ymin"]) - 1000, as.numeric(bbx["ymax"]) + 1000)) +
+    labs(title = title, fill = "Restaurants") +
+    theme_report() + theme(axis.title = element_blank())
+}
+
+for (nm in c("Census tract", "Census block group")) {
+  p <- map_counts(systems[[nm]], area_list[[nm]],
+                  paste0(nm, ": selected restaurants per area"))
+  print(p)
+  slug <- str_replace_all(str_to_lower(nm), "[^a-z0-9]+", "_")
+  ggsave(paste0("figures/map_counts_", slug, ".png"), p, width = 8, height = 7, dpi = 200)
+}
+```
+
+### Results by ZIP/ZCTA
 
 ```{r zip-results}
-area_list[["ZIP/ZCTA"]] |>
+zip_tbl <- area_list[["ZIP/ZCTA"]] |>
   filter(n_restaurants >= 5) |>
-  arrange(desc(avg_review_stars)) |>
-  select(area_name, n_restaurants, total_reviews,
-         avg_business_stars, avg_review_stars) |>
-  knitr::kable(digits = 2,
-    caption = "ZIP/ZCTA areas with at least five selected restaurants")
+  arrange(desc(avg_review_stars))
+
+zip_tbl |>
+  select(area_name, n_restaurants, total_reviews, avg_business_stars, avg_review_stars) |>
+  knitr::kable(digits = 2, caption = "ZIP/ZCTA areas with at least five selected restaurants")
+
+zip_most <- area_list[["ZIP/ZCTA"]] |> arrange(desc(n_restaurants)) |> slice_head(n = 1)
+zip_next <- area_list[["ZIP/ZCTA"]] |> arrange(desc(n_restaurants)) |> slice(2:4)
 ```
 
-Among ZIP areas with at least five restaurants, ZIP 70112 has the highest raw
-average review score (about 4.41), followed closely by ZIP 70113 (about 4.40)
-and ZIP 70118 (about 4.33). ZIP 70130 has the largest number of qualifying
-restaurants (26), while ZIP 70116, 70119, 70115, 70112, and 70118 also have
-substantial numbers of restaurants.
-This distinction matters: the area with the highest average is not necessarily
-the area with the greatest choice.
+Among ZIP areas with at least five restaurants, `r zip_tbl$area_name[1]` has the highest raw average review score (about `r round(zip_tbl$avg_review_stars[1], 2)`), followed by `r zip_tbl$area_name[2]` (`r round(zip_tbl$avg_review_stars[2], 2)`) and `r zip_tbl$area_name[3]` (`r round(zip_tbl$avg_review_stars[3], 2)`). Differences of a few hundredths of a star are practical ties. `r zip_most$area_name` has the largest number of qualifying restaurants (`r zip_most$n_restaurants`), followed by `r paste0(zip_next$area_name, " (", zip_next$n_restaurants, ")", collapse = ", ")`. The area with the highest average is therefore not necessarily the area with the most choice.
 
-```{r area-map, fig.width=8, fig.height=7}
+```{r zip-map, fig.width=8, fig.height=7}
 area_map <- zcta |>
   inner_join(area_list[["ZIP/ZCTA"]], by = c("area_id", "area_name"))
+bb_zip <- st_bbox(area_map)
 
-ggplot(area_map) +
+p_zip <- ggplot(area_map) +
   geom_sf(aes(fill = n_restaurants), color = "white", linewidth = 0.2) +
-  scale_fill_viridis_c(option = "C", na.value = "grey85") +
+  geom_sf(data = nola_boundary, fill = NA, color = "black", linewidth = 0.6) +
+  geom_sf_label(aes(label = area_id), size = 3, fontface = "bold", fill = alpha("white", 0.8)) +  scale_fill_viridis_c(option = "C") +
+  coord_sf(xlim = c(as.numeric(bb_zip["xmin"]) - 1000, as.numeric(bb_zip["xmax"]) + 1000),
+           ylim = c(as.numeric(bb_zip["ymin"]) - 1000, as.numeric(bb_zip["ymax"]) + 1000)) +
   labs(title = "Halal, vegetarian, and vegan restaurants by ZIP/ZCTA",
-       fill = "Restaurants") +
-  theme_minimal()
+       subtitle = "Black outline = official New Orleans city boundary", fill = "Restaurants") +
+  theme_report() + theme(axis.title = element_blank())
+print(p_zip)
+ggsave("figures/map_zip_restaurant_counts.png", p_zip, width = 8, height = 7, dpi = 200)
 ```
 
-### Choosing ZIP/ZCTA
+### My choice: ZIP/ZCTA
 
-I chose **ZIP/ZCTA** as the primary geographic system. ZIP areas fit the
-practical question of where a visitor can look for restaurants, are easier to
-interpret than Census identifiers, support a readable map, contain all 125
-selected restaurants, and generally provide more stable comparisons than the
-smaller tract and block-group areas. ZIP/ZCTAs do not represent neighborhoods,
-and their boundaries are designed for Census tabulation rather than exact
-postal delivery routes. They can also combine places that feel different on the
-ground. Census tracts and block groups reveal finer spatial variation but hide
-the instability caused by very small restaurant counts.
+I chose **ZIP/ZCTA** as the primary geographic system. ZIP areas fit the practical question of where a visitor can look for restaurants and are easier for a general audience to read than Census identifiers. They contain all `r zip_row$assigned` mapped restaurants with `r zip_row$unmatched` unmatched, they divide the restaurants into `r zip_row$n_areas` areas (`r zip_row$areas5` with at least five restaurants), and they support a readable, labeled map. Census tracts and block groups show finer detail, but most of their areas contain only one or two selected restaurants, so their averages would depend on single businesses, and one restaurant was unmatched in each of those systems.
 
-### Limitations
+ZIP/ZCTAs also have weaknesses. They are Census approximations of postal areas, not neighborhoods, and they can combine places that feel different on the ground. Some ZIP polygons extend beyond the city limits (the map shows one on the Jefferson Parish side), so "areas" here does not mean "areas inside New Orleans". I did not choose ZIP/ZCTA because it produced the highest or most interesting rating; I chose it because the sample sizes and the readability supported a defensible comparison.
 
-The main limitations are that the Yelp categories are user/platform labels and
-do not independently verify that a restaurant is halal, vegetarian, or vegan.
-The analysis is also observational: Yelp review volume and ratings may reflect
-who chooses to review, not only restaurant quality. Several areas have only one
-or a few restaurants, and the Yelp city label disagrees with the official city
-polygon for 57 businesses in the full restaurant dataset. Finally, the scores
-shown here are ordinary review averages and are not adjusted for reviewer
-scoring habits; reviewer normalization is reserved for Step 7.
+## Step 7: All reviewers versus selected reviewers
+
+### Ratings from all reviewers
+
+```{r all-reviewers}
+all_reviewer_summary <- selected_reviews |>
+  group_by(business_id) |>
+  summarise(n_reviews_all = n(), avg_stars_all = mean(stars),
+            median_stars_all = median(stars), .groups = "drop")
+
+all_reviewer_summary |>
+  left_join(select(selected_restaurants, business_id, business_name), by = "business_id") |>
+  arrange(desc(avg_stars_all)) |>
+  select(business_name, n_reviews_all, avg_stars_all) |>
+  slice_head(n = 10)
+```
+
+A ranking by raw average alone favors restaurants with very few reviews, because a handful of five-star reviews gives a perfect average. This is why review volume and reliability are part of my definition of "best".
+
+### Choosing reviewers with enough activity
+
+```{r reviewer-activity}
+reviewer_activity <- selected_reviews |> count(user_id, name = "reviews_in_group")
+
+threshold_table <- map_dfr(c(2, 3, 5, 10), function(k) {
+  keep <- filter(reviewer_activity, reviews_in_group >= k)
+  tibble(`Minimum reviews per reviewer` = k,
+         `Reviewers retained` = nrow(keep),
+         `Reviews retained` = sum(keep$reviews_in_group),
+         `% of all reviews` = round(100 * sum(keep$reviews_in_group) / nrow(selected_reviews), 1))
+})
+knitr::kable(threshold_table, caption = "Reviewers and reviews retained at each activity threshold")
+```
+
+```{r settings}
+min_reviews <- 5               # EDIT if too few reviewers are retained; justify the change in the text
+min_elig_per_restaurant <- 5   # eligible reviews a restaurant needs in order to be ranked
+shrink_k <- 5                  # pseudo-reviews at score 0 that smooth small samples
+```
+
+#### Threshold I chose
+
+I chose a minimum of 5 reviews within the selected restaurants. At that threshold, 350 reviewers are eligible, and they wrote 2,820 reviews, 9.6% of all reviews for the selected restaurants. Lower thresholds keep more data (3 reviews: 1,224 reviewers and 19.4% of reviews; 2 reviews: 3,433 reviewers and 34.4%), but a baseline built from two or three ratings says little about a reviewer's usual behavior. A threshold of 10 keeps only 76 reviewers and 3.9% of reviews, which would leave too many restaurants without enough adjusted reviews. With a threshold of 5, 99 of the 125 restaurants still have at least five eligible reviews and can be ranked. The trade-off is that the adjusted analysis uses a minority of the reviews, so I treat it as a complement to the raw ratings and not a replacement.
+
+### Reviewer-normalized scores
+
+Some reviewers give nearly everything five stars; others rarely do. For each eligible reviewer I compute a baseline, the mean of their ratings within the selected restaurants, and subtract it from each of their ratings. A normalized score of 0 means "the reviewer rated this place about as they usually rate"; +1 means one star above their usual. This is not a new Yelp rating. It measures whether a rating was higher or lower than that reviewer's own habit. I use the mean baseline because ratings are whole numbers from 1 to 5, and a median baseline with few reviews per reviewer is very coarse. I check the median-based version as a robustness test below.
+
+```{r normalize}
+reviewer_baselines <- selected_reviews |>
+  group_by(user_id) |>
+  summarise(reviewer_mean = mean(stars), reviewer_median = median(stars),
+            reviews_in_group = n(), .groups = "drop") |>
+  filter(reviews_in_group >= min_reviews)
+
+adjusted_reviews <- selected_reviews |>
+  inner_join(reviewer_baselines, by = "user_id") |>
+  mutate(norm_mean = stars - reviewer_mean,
+         norm_median = stars - reviewer_median)
+
+cat("Eligible reviewers:", nrow(reviewer_baselines),
+    "| eligible reviews:", nrow(adjusted_reviews),
+    "(", round(100 * nrow(adjusted_reviews) / nrow(selected_reviews), 1), "% of reviews )\n")
+```
+
+```{r restaurant-summary}
+elig_summary <- adjusted_reviews |>
+  group_by(business_id) |>
+  summarise(n_reviews_eligible = n(), avg_stars_eligible = mean(stars),
+            avg_norm_mean = mean(norm_mean), avg_norm_median = mean(norm_median),
+            sum_norm_mean = sum(norm_mean), .groups = "drop")
+
+restaurant_summary <- selected_restaurants |>
+  select(business_id, business_name, address, postal_code, latitude, longitude) |>
+  left_join(all_reviewer_summary, by = "business_id") |>
+  left_join(elig_summary, by = "business_id") |>
+  mutate(n_reviews_eligible = replace_na(n_reviews_eligible, 0L),
+         shrunk_score = sum_norm_mean / (n_reviews_eligible + shrink_k))
+
+rank_pool <- restaurant_summary |>
+  filter(n_reviews_eligible >= min_elig_per_restaurant) |>
+  mutate(rank_raw = min_rank(desc(avg_stars_all)),
+         rank_adjusted = min_rank(desc(shrunk_score)),
+         rank_change = rank_raw - rank_adjusted)   # positive = moves up after adjustment
+
+cat("Restaurants eligible for ranking:", nrow(rank_pool), "of", nrow(restaurant_summary), "\n")
+cat("Correlation of mean- and median-based adjusted scores:",
+    round(cor(rank_pool$avg_norm_mean, rank_pool$avg_norm_median, use = "complete.obs"), 3), "\n")
+```
+
+To rank restaurants fairly, I only rank restaurants with at least `r min_elig_per_restaurant` eligible reviews. I also shrink each restaurant's adjusted score toward 0 by adding `r shrink_k` "pseudo-reviews" at score 0 to the denominator, so a restaurant with a handful of reviews cannot outrank a restaurant with many on small-sample luck: `shrunk score = (sum of normalized scores) / (number of eligible reviews + k)`.
+
+### Comparing raw ratings with reviewer-adjusted scores
+
+```{r raw-vs-adjusted, fig.width=8, fig.height=5.5}
+p_adj <- ggplot(rank_pool, aes(avg_stars_all, avg_norm_mean)) +
+  geom_hline(yintercept = 0, color = "grey70") +
+  geom_point(aes(size = n_reviews_all), alpha = 0.6) +
+  labs(title = "Raw restaurant ratings compared with reviewer-adjusted scores",
+       x = "Average stars from all reviewers",
+       y = "Average normalized score (eligible reviewers)", size = "Reviews") +
+  theme_report()
+print(p_adj)
+ggsave("figures/raw_vs_adjusted.png", p_adj, width = 8, height = 5.5, dpi = 200)
+```
+
+```{r biggest-movers}
+rank_pool |>
+  arrange(desc(abs(rank_change))) |>
+  select(business_name, n_reviews_all, n_reviews_eligible, avg_stars_all,
+         avg_norm_mean, rank_raw, rank_adjusted, rank_change) |>
+  slice_head(n = 10) |>
+  knitr::kable(digits = 2, caption = "Restaurants whose rank changes most after reviewer adjustment")
+```
+
+#### Biggest movers
+
+The adjusted ranking differs a lot from the raw ranking, and the mean- and median-based adjusted scores agree closely (correlation 0.949), so the choice of baseline is not driving the result. Green To Go moves from 81st by raw rating (3.70 stars) to 4th after adjustment: its 6 eligible reviewers rated it about 0.62 stars above their own usual ratings. Sugar Park (77th to 26th), LemonShark Poke (46th to 7th), Piscobar, La Crepe Nanou, and Mezze Mediterranean also move up. In the other direction, Catalino's (4.73 stars, 5th) falls to 63rd and Nola Vegan (4.56 stars, 21st) falls to 78th, because their eligible reviewers rated them below their own usual scores (-0.09 and -0.29); La Macarena Pupuseria (52nd to 91st) and Max Well (31st to 70th) fall for the same reason. Reviewer habits explain much of this: a restaurant that looks excellent in raw stars may have been rated mostly by generous reviewers, and one with a modest average may have impressed reviewers who normally rate harshly. Small samples also play a role, since several large movers rest on only 6 to 14 eligible reviews (Green To Go 6, Mezze Mediterranean 7, Nola Vegan 8, Piscobar 12, Catalino's 14), so their new ranks are less certain than those of restaurants with dozens of eligible reviews such as La Crepe Nanou (33) and LemonShark Poke (23).
+
+### Which area is best, raw versus adjusted?
+
+```{r zip-adjusted}
+zip_lookup <- assigned_list[["ZIP/ZCTA"]] |> select(business_id, area_id, area_name)
+
+zip_compare <- adjusted_reviews |>
+  inner_join(zip_lookup, by = "business_id") |>
+  filter(!is.na(area_id)) |>
+  group_by(area_id, area_name) |>
+  summarise(n_eligible_reviews = n(), avg_norm_score = mean(norm_mean), .groups = "drop") |>
+  left_join(select(area_list[["ZIP/ZCTA"]], area_id, n_restaurants, avg_review_stars),
+            by = "area_id") |>
+  filter(n_restaurants >= 5) |>
+  mutate(rank_raw = min_rank(desc(avg_review_stars)),
+         rank_adjusted = min_rank(desc(avg_norm_score))) |>
+  arrange(rank_adjusted)
+
+knitr::kable(zip_compare, digits = 2,
+             caption = "ZIP areas with at least five restaurants: raw versus reviewer-adjusted ranks")
+```
+
+The best area changes after adjustment. By raw average review stars, ZIP 70112 ranks first (4.41), followed by ZIP 70113 (4.40) and ZIP 70118 (4.33). After reviewer adjustment, ZIP 70113 ranks first (average normalized score +0.11), followed by ZIP 70119 (+0.06), ZIP 70115 (+0.05), and ZIP 70117 (+0.05), while ZIP 70112 falls to 5th (+0.01) and ZIP 70118 falls from 3rd to 8th (-0.07). Reliability matters here: ZIP 70113's adjusted score rests on 85 eligible reviews across 6 restaurants, far fewer than ZIP 70119 (379 eligible reviews, 19 restaurants), ZIP 70115 (405, 14 restaurants), and ZIP 70117 (273, 15 restaurants), so the lead of ZIP 70113 is the least certain, and the differences between areas are small. Weighing the evidence, ZIP 70119 is the most dependable recommendation: it ranks 2nd after adjustment, has the second-largest number of restaurants (19), has 379 eligible reviews behind its score, and contains the #1 and #3 restaurants on my top-10 list.
+
+## The answer: top 10 restaurants
+
+```{r top10}
+top10 <- rank_pool |>
+  arrange(desc(shrunk_score)) |>
+  slice_head(n = 10) |>
+  left_join(select(zip_lookup, business_id, zip_area = area_name), by = "business_id") |>
+  mutate(rank = row_number())
+
+top10_table <- top10 |>
+  transmute(Rank = rank, Restaurant = business_name, ZIP = zip_area,
+            `Reviews (all)` = n_reviews_all, `Reviews (eligible)` = n_reviews_eligible,
+            `Avg stars (all)` = round(avg_stars_all, 2),
+            `Avg normalized score` = round(avg_norm_mean, 2),
+            `Raw rank in pool` = rank_raw)
+
+knitr::kable(top10_table, caption = "Top 10 restaurants by reviewer-adjusted score")
+writeLines(knitr::kable(top10_table, format = "markdown"), "figures/top10_table.md")
+```
+
+```{r top10-map, fig.width=8, fig.height=7}
+top10_pts <- make_points(top10)
+
+p_top10 <- ggplot() +
+  geom_sf(data = area_map, fill = "grey95", color = "grey60", linewidth = 0.3) +
+  geom_sf(data = nola_boundary, fill = NA, color = "black", linewidth = 0.5) +
+  geom_sf(data = top10_pts, color = "firebrick", size = 6) +
+  geom_sf_text(data = top10_pts, aes(label = rank), color = "white", size = 3,
+               fontface = "bold") +
+  coord_sf(xlim = c(as.numeric(bb_zip["xmin"]) - 1000, as.numeric(bb_zip["xmax"]) + 1000),
+           ylim = c(as.numeric(bb_zip["ymin"]) - 1000, as.numeric(bb_zip["ymax"]) + 1000)) +
+  labs(title = "Top 10 halal, vegetarian, and vegan restaurants",
+       subtitle = "Grey = ZIP areas with a selected restaurant; black outline = New Orleans city boundary") +
+  theme_report() + theme(axis.title = element_blank())
+print(p_top10)
+ggsave("figures/top10_map.png", p_top10, width = 8, height = 7, dpi = 200)
+```
+
+```{r top10-sensitivity}
+rank_top10 <- function(min_elig, k) {
+  restaurant_summary |>
+    filter(n_reviews_eligible >= min_elig) |>
+    mutate(score = sum_norm_mean / (n_reviews_eligible + k)) |>
+    arrange(desc(score)) |>
+    slice_head(n = 10) |>
+    pull(business_id)
+}
+base_ids <- rank_top10(5, 5)
+sens <- expand_grid(min_elig = c(5, 10), k = c(5, 10, 20)) |>
+  mutate(overlap_with_main = map2_int(min_elig, k, ~ length(intersect(base_ids, rank_top10(.x, .y)))))
+knitr::kable(sens, caption = "How many of my top 10 stay in the top 10 under other settings?")
+```
+
+```{r sensitivity-text, include=FALSE}
+others <- filter(sens, !(min_elig == 5 & k == 5))
+stay_all <- reduce(map2(sens$min_elig, sens$k, rank_top10), intersect)
+stay_names <- top10 |> filter(business_id %in% stay_all) |> pull(business_name)
+stay_text <- if (length(stay_names) > 0) paste(stay_names, collapse = ", ") else "none of them"
+stable_text <- if (min(others$overlap_with_main) >= 8) "fairly stable" else "sensitive to these settings"
+```
+
+#### How stable is the top 10?
+
+To check how fragile the top 10 is, I re-ranked the restaurants under five alternative settings (at least 5 or 10 eligible reviews, and 5, 10, or 20 pseudo-reviews of shrinkage). Between `r min(others$overlap_with_main)` and `r max(others$overlap_with_main)` of my 10 restaurants stayed in the top 10 under these settings, so the list is `r stable_text`. The restaurants that stayed in the top 10 under every setting were: `r stay_text`. I therefore read the top 10 as a set of strong leads, not an exact ranking, and the restaurants that stay in every version are the most dependable picks.
+
+#### My final answers
+
+**Top 10.** Using the reviewer-adjusted score (shrunk toward zero) among restaurants with at least five eligible reviews, my top 10 is: 1. The Fat Falafel, 2. Ms. Beasley's, 3. Addis Nola, 4. Green To Go, 5. Capulet, 6. Botanicals Nola, 7. LemonShark Poke, 8. I-tal Garden, 9. Breads on Oak Cafe & Bakery, and 10. Tea Witch Cafe. They are spread across seven ZIP areas, with two each in ZIP 70119, 70117, and 70130. Only six of the ten are also in the raw top 10 among the 99 ranked restaurants; Ms. Beasley's, Green To Go, LemonShark Poke, and Breads on Oak enter the list only after adjustment.
+
+**Best area.** I recommend ZIP 70119, which combines choice (19 restaurants) with a strong adjusted score. ZIP 70130 offers the most choice (26 restaurants), and ZIP 70113 has the highest adjusted score but is supported by only 85 eligible reviews.
+
+**How "best" is defined.** I ranked by the reviewer-adjusted score after shrinkage, among restaurants with at least five eligible reviews. Raw stars and review counts are shown alongside, and the shrinkage rule keeps small samples from dominating.
+
+**Reliability.** Seven of the ten restaurants rest on only 5 to 10 eligible reviews; Breads on Oak (83 eligible reviews), Addis Nola (28), and LemonShark Poke (23) have the most support. The ranking should be read as strong leads to try, not as precise ranks.
+
+## Limitations
+
+* **Yelp categories are labels, not certification.** A restaurant tagged halal, vegetarian, or vegan has not been independently verified, and a Yelp category does not guarantee that the kitchen can safely accommodate a given dietary restriction or allergy.
+* **Observational data.** Ratings and review counts reflect who chooses to review, not only restaurant quality. Review volume also reflects tourism and popularity.
+* **Small groups.** Several areas have only a few restaurants. Halal restaurants are rare in this dataset, so halal options are thin in many areas.
+* **Boundary issues.** Yelp's city label disagrees with the official city polygon for some restaurants (see Step 5), and ZIP/ZCTA polygons can extend beyond the city. ZIP areas are not neighborhoods.
+* **Reviewer normalization.** Each reviewer's baseline is computed from the same reviews being adjusted, which pulls scores toward zero for reviewers with few reviews. The adjusted score also depends on the threshold I chose. Most reviewers have only one or two reviews in this group, so the adjusted analysis uses a minority of all reviews. The shrinkage rule smooths small samples but is a modeling choice, not an official metric.
+* **Time.** The dataset ends in January 2022, so recent openings and closures are not captured.
