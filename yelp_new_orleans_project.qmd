@@ -422,7 +422,7 @@ knitr::kable(threshold_table, caption = "Reviewers and reviews retained at each 
 ```
 
 ```{r settings}
-min_reviews <- 5               # EDIT if too few reviewers are retained; justify the change in the text
+min_reviews <- 5               
 min_elig_per_restaurant <- 5   # eligible reviews a restaurant needs in order to be ranked
 shrink_k <- 5                  # pseudo-reviews at score 0 that smooth small samples
 ```
