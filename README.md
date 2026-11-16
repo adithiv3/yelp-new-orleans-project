@@ -31,6 +31,8 @@ Using all 476,421 Yelp reviews of New Orleans restaurants, I found 125 restauran
 
 Ranked by reviewer-adjusted score after shrinkage, so the order is not simply by the "Avg normalized score" column.
 
+Stability check: When I re-ranked the restaurants under five alternative settings (a minimum of 5 or 10 eligible reviews, and 5, 10, or 20 pseudo-reviews of shrinkage), only 3 to 6 of these 10 stayed in the top 10, and only Addis Nola, LemonShark Poke, and Breads on Oak Cafe & Bakery stayed in every version, so read this list as strong leads, not an exact ranking.
+
 ![Top 10 restaurants map](figures/top10_map.png)
 
 ## Choosing a geographic area
